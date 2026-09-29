@@ -2,9 +2,8 @@
 
 This directory contains all Triton- and Gluon-based kernels and their Python
 wrappers used by AITER. This README documents the conventions that every
-change under `aiter/ops/triton/` is expected to follow. For anything touching
-the tuned-config JSON tree, **`configs/CLAUDE.md` is the authoritative
-rulebook** — this README summarizes it; that file wins on any conflict.
+change under `aiter/ops/triton/` is expected to follow, the tuned-config JSON
+tree included (*Tuned configs* below).
 
 PR reviews under this directory are additionally checked by Copilot against
 `.github/instructions/aiter-ops-triton.instructions.md`, which encodes the
@@ -32,7 +31,7 @@ aiter/ops/triton/
 ├── gluon/                 # Gluon-backend wrappers
 ├── _triton_kernels/       # @triton.jit kernel bodies (mirrors the wrapper layout)
 ├── _gluon_kernels/        # Gluon kernel bodies
-├── configs/               # tuned JSON configs — read configs/CLAUDE.md before editing
+├── configs/               # tuned JSON configs — see Tuned configs below
 └── utils/                 # shared machinery: config loading, shuffling, repr, arch info
 ```
 
@@ -307,10 +306,12 @@ depend on a benchmark.
   `M_LEQ_x`/`M_GEQ_y` scheme in either direction.
 - `configs/gemm/aot/` and `configs/paged_mqa_logits/aot/` are runtime AOT
   caches, not tuning configs — never check them in or migrate them.
+- An arch that ships no file for a family may be seeded with a byte-identical
+  copy from the closest measured arch, said so in the commit message. The one
+  seeding path in force is gfx950 → gfx1250, triton only: never into a gluon
+  directory, never back into gfx950. A seed is a placeholder, not tuning.
 
-For adding a config, seeding a new arch, and the per-family key schemes, follow
-`configs/CLAUDE.md` (§5 and §6). For the manual tuning flow, see
-`utils/_triton/tuning/README.md`.
+For the manual tuning flow, see `utils/_triton/tuning/README.md`.
 
 ---
 
