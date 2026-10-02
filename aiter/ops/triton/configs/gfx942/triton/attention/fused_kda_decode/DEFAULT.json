@@ -1,5 +1,6 @@
 {
     "fused_conv_recurrent_norm_kernel": {
-        "num_warps": 2
+        "num_warps": 2,
+        "num_stages": 2
     }
 }

@@ -351,5 +351,6 @@ def fused_kda_decode(
         stride_indices_tok=stride_indices_tok,
         stride_cidx=stride_cidx,
         num_warps=generic_cfg.num_warps,
+        num_stages=generic_cfg.num_stages,
     )
     return out

@@ -122,6 +122,9 @@ def fused_conv_recurrent_norm_kernel(
     seq_T = eos - bos
     if seq_T == 0:
         return
+    # Slot indices load as int64 so idx * stride_ssm_slot and idx * stride_cs_slot
+    # cannot overflow int32. The strides stay plain args to let Triton
+    # specialize them.
     if IS_SPEC_DECODING:
         # Three history taps are kept in registers. The wrapper rejects any
         # other width before launch.
@@ -509,6 +512,7 @@ def fused_kda_spec_parallel_v_kernel(
 
     checkpoint = tl.maximum(tl.load(num_accepted_tokens_ptr + i_n).to(tl.int64) - 1, 0)
     tl.assume(checkpoint >= 0)
+    # int64 on load keeps the slot offsets from overflowing int32.
     read_state_idx = tl.load(
         ssm_state_indices_ptr
         + i_n * stride_indices_seq
@@ -708,7 +712,8 @@ def fused_kda_spec_finalize_kernel(
         return
 
     # Same validity test as the parallel kernel: when it returned early, the
-    # carry was never written and the output was never produced.
+    # carry was never written and the output was never produced. int64 on load
+    # keeps the slot offsets from overflowing int32.
     checkpoint = tl.maximum(tl.load(num_accepted_tokens_ptr + i_n).to(tl.int64) - 1, 0)
     read_state_idx = tl.load(
         ssm_state_indices_ptr
