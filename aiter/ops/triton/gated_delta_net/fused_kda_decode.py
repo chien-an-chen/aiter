@@ -139,11 +139,8 @@ def fused_kda_decode(
         stride_indices_tok = 1
         # Unused off the speculative path; the pointers alias ssm_state_indices.
         stride_cidx = 1
-    # Every kernel declares tl.assume(stride > 0) on these two. A single
-    # sequence only ever forms i_n == 0, so the offset is zero whatever the
-    # stride is, but a broadcast tensor's stride of 0 would make that
-    # assumption false and license wrong codegen. The checks above already
-    # reject a stride that would actually mis-address, at batch > 1.
+    # A single sequence only forms i_n == 0, so normalize a zero stride before
+    # passing it to kernels that assume positive strides.
     if batch <= 1:
         stride_cidx = max(stride_cidx, 1)
         stride_indices_seq = max(stride_indices_seq, 1)
@@ -211,17 +208,7 @@ def fused_kda_decode(
         and K == 128
         and V % block_v == 0
         and W == 4
-        # Speedup over the generic kernel, gfx950 Hloc=12 D=128, median of 5.
-        # batch is cu_seqlens.shape[0] - 1, so under full CUDA graphs it is the
-        # capture size, not the live sequence count.
-        #
-        #  spec_tokens   b1    b2    b4    b8   b16   b24   b32   b48
-        #      2        0.77  0.75  0.78  0.94  1.18  1.14  1.06  1.41
-        #      3        1.03  1.03  1.11  1.31  1.29  1.20  1.12  1.40
-        #      4        1.23  1.28  1.39  1.65  1.41  1.36  1.19  1.54
-        #      8        2.24  2.46  2.32  1.93  1.70  1.56  1.31  1.62
-        #
-        # Width 2 is the only loser: too few tokens to be worth splitting.
+        # Width 2 only beats the generic kernel at larger graph batches.
         and (spec_tokens >= 3 or batch >= 16)
         # The recurrence reads conv history at checkpoint + W - 2 and finalize
         # writes it at W - 2 + i_t, both with an index up to spec_tokens + 1.
@@ -351,6 +338,5 @@ def fused_kda_decode(
         stride_indices_tok=stride_indices_tok,
         stride_cidx=stride_cidx,
         num_warps=generic_cfg.num_warps,
-        num_stages=generic_cfg.num_stages,
     )
     return out

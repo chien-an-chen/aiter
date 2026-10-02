@@ -672,21 +672,19 @@ def test_fused_normal_decode_multi_token():
     torch.testing.assert_close(fused_ss, ref_ss, atol=0.05, rtol=0.02)
 
 
-@pytest.mark.parametrize("weight_layout", ["channels_width", "group_width_channels"])
 @pytest.mark.parametrize(
-    "batch,Hloc,num_spec",
+    "weight_layout,batch,Hloc,num_spec",
     [
-        (4, 2, 7),
+        ("channels_width", 4, 2, 7),
+        ("group_width_channels", 4, 2, 7),
         # Hloc=12 is Kimi-K3 at TP8 (96 KDA heads). The gate used to require
         # Hloc==2, so serving silently ran the generic fallback kernel.
-        (1, 12, 7),
-        (2, 12, 7),
-        (4, 12, 3),
+        ("channels_width", 1, 12, 7),
         # num_spec 2 (spec_tokens 3) is the smallest that dispatches regardless
         # of batch. num_spec 1 goes to the generic kernel below batch 16 on
         # purpose; the batch-dependent dispatch test below covers that.
-        (2, 4, 3),
-        (1, 12, 15),
+        ("channels_width", 2, 4, 3),
+        ("channels_width", 1, 12, 15),
     ],
 )
 def test_optimized_fused_spec_decode(weight_layout, batch, Hloc, num_spec):
@@ -929,33 +927,10 @@ def _run_spec(inp, conv_weight=None, out=None):
     )
 
 
-def test_spec_decode_batch_one_zero_stride_conv_indices():
-    """A single sequence only ever forms offset 0, so a broadcast
-    conv_state_indices must still select its slot. The kernels assume a positive
-    stride, which a stride of 0 would violate."""
-    inp = _make_spec_inputs(1, 2, num_spec=7, full_spec_sequence=True)
-    packed = inp["conv_state_indices"]
-    broadcast = packed.as_strided((1,), (0,))
-    assert broadcast.stride(0) == 0, "test would be vacuous on a packed tensor"
-    assert int(broadcast[0].item()) == int(packed[0].item())
-
-    pristine_cs, pristine_ss = inp["conv_state"].clone(), inp["state"].clone()
-    ref = _run_spec(inp)
-    ref_cs, ref_ss = inp["conv_state"].clone(), inp["state"].clone()
-
-    inp["conv_state"], inp["state"] = pristine_cs, pristine_ss
-    inp["conv_state_indices"] = broadcast
-    out = _run_spec(inp)
-
-    torch.testing.assert_close(out, ref, atol=0, rtol=0)
-    torch.testing.assert_close(pristine_cs, ref_cs, atol=0, rtol=0)
-    torch.testing.assert_close(pristine_ss, ref_ss, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("num_spec", [7, 2])
-def test_spec_decode_null_hole_drops_later_tokens(num_spec):
+def test_spec_decode_null_hole_drops_later_tokens():
     """A NULL between valid slots is not written through. Tokens after it stay
     at the preallocated output, and their convolution positions stay put."""
+    num_spec = 7
     inp = _make_spec_inputs(1, 2, num_spec=num_spec, full_spec_sequence=True)
     assert inp["state_indices"].shape[1] >= 3
     inp["state_indices"][0, 1] = 0

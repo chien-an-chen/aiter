@@ -11,10 +11,6 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-_fused_conv_recurrent_norm_repr = make_kernel_repr(
-    "fused_conv_recurrent_norm_kernel",
-    ["H", "K", "V", "W", "STATE_LEN", "IS_SPEC_DECODING", "SPEC_LEN"],
-)
 _fused_kda_spec_parallel_v_repr = make_kernel_repr(
     "fused_kda_spec_parallel_v_kernel",
     ["H", "K", "V", "W", "BV", "SPEC_LEN"],
@@ -48,7 +44,7 @@ def _valid_spec_prefix(
     return valid
 
 
-@triton.jit(repr=_fused_conv_recurrent_norm_repr)
+@triton.jit
 def fused_conv_recurrent_norm_kernel(
     # Conv1d inputs
     x_ptr,  # [B, 3*lp] bf16 (may be strided slice)
@@ -122,9 +118,8 @@ def fused_conv_recurrent_norm_kernel(
     seq_T = eos - bos
     if seq_T == 0:
         return
-    # Slot indices load as int64 so idx * stride_ssm_slot and idx * stride_cs_slot
-    # cannot overflow int32. The strides stay plain args to let Triton
-    # specialize them.
+    # Cast slot indices to int64 before multiplying large cache strides; keep
+    # the strides specializable.
     if IS_SPEC_DECODING:
         # Three history taps are kept in registers. The wrapper rejects any
         # other width before launch.
@@ -512,7 +507,6 @@ def fused_kda_spec_parallel_v_kernel(
 
     checkpoint = tl.maximum(tl.load(num_accepted_tokens_ptr + i_n).to(tl.int64) - 1, 0)
     tl.assume(checkpoint >= 0)
-    # int64 on load keeps the slot offsets from overflowing int32.
     read_state_idx = tl.load(
         ssm_state_indices_ptr
         + i_n * stride_indices_seq
@@ -712,8 +706,7 @@ def fused_kda_spec_finalize_kernel(
         return
 
     # Same validity test as the parallel kernel: when it returned early, the
-    # carry was never written and the output was never produced. int64 on load
-    # keeps the slot offsets from overflowing int32.
+    # carry was never written and the output was never produced.
     checkpoint = tl.maximum(tl.load(num_accepted_tokens_ptr + i_n).to(tl.int64) - 1, 0)
     read_state_idx = tl.load(
         ssm_state_indices_ptr
