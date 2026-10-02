@@ -553,6 +553,154 @@ def test_moe_sorting_invalid_topk_ids():
     )
 
 
+def _check_mxfp4_aux_sort(ref, out, topk_ids, num_experts, block_size):
+    """Compare the MXFP4 aux sort (_adaptive_moe_sort, emit_aux=True) with the
+    torch reference. Within an expert the aux sort places routes in atomic
+    order and pads with token id M (no slot bits), so each expert's routes are
+    compared as a set; reverse_sorted must point valid routes at their sorted
+    slot and be -1 for the dropped ones."""
+    ref_ids, ref_w, ref_eids, ref_nv = ref
+    ids, w, eids, nv, _moe_buf, m_indices, reverse_sorted = out
+    M, topk = topk_ids.shape
+    errs = {}
+    total = int(ref_nv[0])
+    if int(nv[0]) != total or int(nv[1]) != M:
+        errs["num_valid_ids"] = (nv.tolist(), ref_nv.tolist())
+        return errs
+    nb = total // block_size
+    if not torch.equal(eids[:nb], ref_eids[:nb]):
+        errs["sorted_expert_ids"] = int((eids[:nb] != ref_eids[:nb]).sum())
+
+    def routes(sorted_ids):
+        # (expert, packed id) of every non-padding slot, as a sorted multiset:
+        # an expert's routes may span blocks in any order.
+        r = sorted_ids[:total].to(torch.int64)
+        e = ref_eids[:nb].to(torch.int64).repeat_interleave(block_size)
+        keep = (r & 0xFFFFFF) < M
+        return ((e[keep] << 32) | r[keep]).sort().values
+
+    a, b = routes(ids), routes(ref_ids)
+    if a.numel() != b.numel() or not torch.equal(a, b):
+        errs["sorted_ids"] = (a.numel(), b.numel())
+
+    flat = topk_ids.reshape(-1)
+    valid = (flat >= 0) & (flat < num_experts)
+    rs = reverse_sorted.to(torch.int64)
+    if not torch.equal(rs[~valid], torch.full_like(rs[~valid], -1)):
+        errs["reverse_sorted(dropped)"] = int((rs[~valid] != -1).sum())
+    pos = rs[valid]
+    route = torch.arange(M * topk, device=flat.device)[valid]
+    packed = ((route % topk) << 24) | (route // topk)
+    if (pos < 0).any() or (pos >= total).any():
+        errs["reverse_sorted(range)"] = int(((pos < 0) | (pos >= total)).sum())
+    else:
+        if not torch.equal(ids[pos].to(torch.int64), packed):
+            errs["reverse_sorted(valid)"] = int(
+                (ids[pos].to(torch.int64) != packed).sum()
+            )
+        if not torch.equal(m_indices[pos].to(torch.int64), route // topk):
+            errs["m_indices"] = int(
+                (m_indices[pos].to(torch.int64) != route // topk).sum()
+            )
+        ref_wt = ref_w.new_zeros(M * topk)
+        rmask = (ref_ids[:total] & 0xFFFFFF) < M
+        ref_r = ref_ids[:total][rmask].to(torch.int64)
+        ref_wt[(ref_r & 0xFFFFFF) * topk + (ref_r >> 24)] = ref_w[:total][rmask]
+        if not torch.equal(w[pos], ref_wt[route]):
+            errs["sorted_weights"] = int((w[pos] != ref_wt[route]).sum())
+    return errs
+
+
+def test_mxfp4_aux_sort_invalid_topk_ids():
+    """The MXFP4 aux sorts (BM16 one-CTA sort and the three-stage sort behind
+    fused_moe's A4W4 inline-sort path) must drop routes outside [0, E), like
+    moe_sorting. vLLM marks CUDA-graph padding rows with -1
+    (VLLM_MOE_SKIP_PADDING=1); these sorts used to index LDS and write
+    sorted_token_ids with them, an out-of-bounds GPU write."""
+    if get_gfx() != "gfx950":
+        aiter.logger.warning("MXFP4 aux sort is gfx950-only; skipping")
+        return
+
+    dtype = dtypes.bf16
+    model_dim = 5120
+    # DSv4.1 target and DSpark draft MoE, which have generated aux-sort instances.
+    for E, topk in ((384, 6), (128, 3)):
+        for block_size, token in (
+            (16, 8),
+            (16, 64),
+            (16, 256),
+            (32, 512),
+            (64, 2048),
+            (128, 4096),
+        ):
+            for routing_case in ("all-empty", "mixed", "padded-rows", "valid"):
+                topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+                    token, model_dim, E, topk, dtype, False, padding_extra=0
+                )
+                if routing_case == "padded-rows":  # vLLM: whole trailing rows are -1
+                    topk_ids[token // 2 :] = -1
+                    topk_weights[token // 2 :] = 0
+                else:
+                    _apply_routing_case(topk_ids, topk_weights, routing_case)
+                ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size)
+                for atomic in (False, True):
+                    out = fm._adaptive_moe_sort(
+                        topk_ids,
+                        topk_weights,
+                        E,
+                        topk,
+                        block_size,
+                        model_dim,
+                        atomic=atomic,
+                        emit_aux=True,
+                    )
+                    torch.cuda.synchronize()
+                    bad = _check_mxfp4_aux_sort(ref, out, topk_ids, E, block_size)
+                    assert not bad, (
+                        f"MXFP4 aux sort mismatch for E={E}, topk={topk}, "
+                        f"block_size={block_size}, token={token}, atomic={atomic}, "
+                        f"routing_case={routing_case}: {bad}"
+                    )
+                    if atomic or routing_case == "valid" or token > 512:
+                        continue
+                    # scatter_reduce skips the dropped routes (reverse_sorted -1).
+                    ids, w, _, nv, _, _, reverse_sorted = out
+                    flat_out = torch.randn(
+                        (ids.numel(), model_dim), dtype=dtype, device="cuda"
+                    )
+                    res = torch.empty((token, model_dim), dtype=dtype, device="cuda")
+                    aiter.mxfp4_moe_scatter_reduce(
+                        flat_out=flat_out,
+                        reverse_sorted=reverse_sorted,
+                        sorted_weights=w,
+                        out=res,
+                        NE=E,
+                        TOPK=topk,
+                        D_HIDDEN=model_dim,
+                        MB=block_size,
+                    )
+                    rs = reverse_sorted.view(token, topk).to(torch.int64)
+                    keep = (rs >= 0).unsqueeze(-1)
+                    rows = flat_out[rs.clamp(min=0)].float()
+                    # where(), not * keep: a dropped route's sorted_weights slot is
+                    # never written and may hold NaN.
+                    contrib = rows * w[rs.clamp(min=0)].unsqueeze(-1)
+                    ref_res = torch.where(keep, contrib, 0.0).sum(1)
+                    assert (
+                        checkAllclose(
+                            ref_res,
+                            res.float(),
+                            atol=5e-2,
+                            rtol=1e-2,
+                            msg=f"scatter_reduce E={E} block_size={block_size} "
+                            f"token={token} {routing_case}",
+                        )
+                        == 0
+                    )
+                    empty = (rs < 0).all(dim=1)
+                    assert not res[empty].any(), "rows with no valid route must be 0"
+
+
 def test_moe_sorting_decode_graph_perf(
     dtype,
     capture_capacity,
