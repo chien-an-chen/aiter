@@ -295,7 +295,6 @@ def fused_kda_decode(
         )
         return out
 
-    generic_cfg = _launch_config("fused_conv_recurrent_norm_kernel")
     grid = (batch, H)
     fused_conv_recurrent_norm_kernel[grid](
         mixed_qkv,
@@ -337,6 +336,6 @@ def fused_kda_decode(
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
         stride_cidx=stride_cidx,
-        num_warps=generic_cfg.num_warps,
+        num_warps=2 if get_arch() == "gfx942" else 4,
     )
     return out

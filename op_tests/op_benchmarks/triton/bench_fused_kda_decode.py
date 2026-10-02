@@ -198,9 +198,8 @@ def run_spec_benchmark(args):
     for batch in args.batches:
         inp = _make_spec_inputs(batch, Hloc, num_spec)
         # Clone once, outside the timed region: per-iteration clones bill the
-        # kernel for bookkeeping serving never does, growing with batch (15% of
-        # the reported number at batch 1, 57% at batch 64). State drifts across
-        # iterations as a result; no branch reads a state value.
+        # kernel for bookkeeping serving never does. State values drift, but
+        # they do not change the launch shape or instruction path.
         cs = inp["conv_state"].clone()
         ss = inp["ssm_state"].clone()
 
@@ -235,7 +234,10 @@ def run_spec_benchmark(args):
 
         real_arch = _fkd.get_arch
         try:
-            _fkd.get_arch = lambda: "gfx942"
+            # Fail only the gfx950 specialized-path gate. Do not return gfx942:
+            # that would also change the generic launch from gfx950's four
+            # warps to gfx942's two warps.
+            _fkd.get_arch = lambda: "gfx950-generic"
             t_generic = triton.testing.do_bench(fn_fused, warmup=50, rep=200) * 1000
         finally:
             _fkd.get_arch = real_arch
